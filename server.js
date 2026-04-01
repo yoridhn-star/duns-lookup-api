@@ -69,13 +69,22 @@ app.post("/api/lookup-duns", async (req, res) => {
       timezoneId: "Europe/Berlin",
     });
 
+    // ── Pre-set TrustArc / GDPR consent cookies ───────────────────────────
+    // Setting these before navigation prevents the cookie banner from showing
+    await context.addCookies([
+      { name: "notice_behavior",            value: "expressed,eu", domain: ".dnb.com", path: "/" },
+      { name: "notice_gdpr_prefs",          value: "0:1:2",        domain: ".dnb.com", path: "/" },
+      { name: "cmapi_cookie_privacy",       value: "permit 1,2,3", domain: ".dnb.com", path: "/" },
+      { name: "truste.eu.cookie.notice_gdpr_pr498", value: "1",   domain: ".dnb.com", path: "/" },
+    ]);
+
     const page = await context.newPage();
 
     // ── Navigate ───────────────────────────────────────────────────────────
     console.log("[lookup] navigating to UPIK...");
     await page.goto("https://www.dnb.com/de-de/upik.html", {
       waitUntil: "domcontentloaded",
-      timeout: 60_000,
+      timeout: 90_000,
     });
 
     // ── Wait for Cloudflare to clear ───────────────────────────────────────
@@ -93,29 +102,69 @@ app.post("/api/lookup-duns", async (req, res) => {
     );
     console.log(`[lookup] page ready — title: "${await page.title()}"`);
 
-    // ── Accept cookies (if banner present) ────────────────────────────────
-    try {
-      // Possible selectors for "required only / obligatoire uniquement" button
-      const cookieSelectors = [
-        'button:has-text("Obligatoire uniquement")',
-        'button:has-text("Nur erforderliche")',
-        'button:has-text("Nur notwendige")',
-        'button:has-text("Accept required")',
-        '[data-testid="accept-required"]',
-        "#onetrust-reject-all-handler",
-      ];
+    // ── Dismiss cookie banner ─────────────────────────────────────────────
+    // Strategy 1: try to click "Obligatoire uniquement" / "Nur erforderliche"
+    let cookieDismissed = false;
+    const cookieSelectors = [
+      'button:has-text("Obligatoire uniquement")',
+      'button:has-text("Nur erforderliche")',
+      'button:has-text("Nur notwendige")',
+      'button:has-text("Accept required")',
+      '[data-testid="accept-required"]',
+      "#onetrust-reject-all-handler",
+      'a:has-text("Obligatoire uniquement")',
+      'a:has-text("Nur erforderliche")',
+    ];
 
-      for (const sel of cookieSelectors) {
+    for (const sel of cookieSelectors) {
+      try {
         const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 2_000 }).catch(() => false)) {
-          await btn.click();
-          console.log(`[lookup] dismissed cookies with: ${sel}`);
-          await page.waitForTimeout(800);
+        if (await btn.isVisible({ timeout: 3_000 }).catch(() => false)) {
+          await btn.click({ timeout: 3_000 });
+          console.log(`[lookup] dismissed cookies (click) with: ${sel}`);
+          await page.waitForTimeout(600);
+          cookieDismissed = true;
           break;
         }
+      } catch {
+        // selector not found or click failed — try next
       }
-    } catch {
-      console.log("[lookup] no cookie banner found, continuing");
+    }
+
+    // Strategy 2 (fallback): remove TrustArc banner nodes directly from the DOM
+    if (!cookieDismissed) {
+      console.log("[lookup] cookie click failed — removing banner via DOM");
+      await page.evaluate(() => {
+        const selectors = [
+          "#truste-consent-track",
+          "#truste-consent-content",
+          ".truste-banner-overlay",
+          "#trustarc-banner-overlay",
+          "#consent_blackbar",
+          "#truste-show-consent",
+          ".truste_popframe",
+          "iframe[id*='trustarc']",
+          "iframe[src*='consent.trustarc']",
+          "iframe[src*='truste']",
+        ];
+        selectors.forEach((sel) => {
+          document.querySelectorAll(sel).forEach((el) => el.remove());
+        });
+        // Set consent cookies via JS so they persist across navigation
+        const cookiesToSet = [
+          "notice_behavior=expressed,eu",
+          "notice_gdpr_prefs=0:1:2",
+          "cmapi_cookie_privacy=permit 1,2,3",
+          "truste.eu.cookie.notice_gdpr_pr498=1",
+        ];
+        cookiesToSet.forEach((c) => {
+          document.cookie = `${c};path=/;domain=.dnb.com`;
+        });
+        // Restore pointer-events in case the overlay was blocking clicks
+        document.body.style.overflow = "auto";
+        document.documentElement.style.overflow = "auto";
+      });
+      await page.waitForTimeout(400);
     }
 
     // ── Select country ─────────────────────────────────────────────────────
