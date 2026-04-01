@@ -34,11 +34,8 @@ app.post("/api/lookup-duns", async (req, res) => {
   if (!companyName || !companyName.trim()) {
     return res.status(400).json({ error: "companyName is required" });
   }
-  if (!email || !email.trim()) {
-    return res.status(400).json({ error: "email is required" });
-  }
 
-  console.log(`[lookup] company="${companyName}" country="${country}" email="${email}"`);
+  console.log(`[lookup] company="${companyName}" country="${country}" email="${email || "(none)"}"`);
 
   let browser = null;
 
@@ -214,8 +211,8 @@ app.post("/api/lookup-duns", async (req, res) => {
 
     console.log(`[lookup] found ${results.length} result(s)`);
 
-    // ── Send email via Resend ──────────────────────────────────────────────
-    if (results.length > 0 && RESEND_API_KEY) {
+    // ── Send email via Resend (optional) ──────────────────────────────────
+    if (results.length > 0 && email && email.trim() && RESEND_API_KEY) {
       try {
         const resend = new Resend(RESEND_API_KEY);
         const resultRows = results
@@ -258,9 +255,15 @@ app.post("/api/lookup-duns", async (req, res) => {
         console.error("[lookup] email send failed:", mailErr.message);
         // Non-fatal — still return results to the caller
       }
-    } else if (!RESEND_API_KEY) {
+    } else if (email && email.trim() && !RESEND_API_KEY) {
       console.warn("[lookup] RESEND_API_KEY not set — skipping email");
     }
+
+    // Build top-level data shortcut (first result) for convenience
+    const first = results[0] || null;
+    const data = first
+      ? { companyName: first.name || companyName, dunsNumber: first.duns, address: first.address }
+      : null;
 
     return res.json({
       success: true,
@@ -268,6 +271,7 @@ app.post("/api/lookup-duns", async (req, res) => {
       country,
       resultsCount: results.length,
       results,
+      data,
     });
   } catch (err) {
     console.error("[lookup] error:", err.message);
