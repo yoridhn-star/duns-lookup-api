@@ -209,26 +209,53 @@ app.post("/api/lookup-duns", async (req, res) => {
     //   D-U-N-S® Nummer: 776849358  ← DUNS line
     //   Unternehmensadresse:         ← address label
     //   38 RUE D'ITALIE, 62570 ...  ← address value
+    //
+    // The page also contains marketing text with "D-U-N-S" mentions (e.g.
+    // "Was ist die D&B D-U-N-S® Nummer?") which must be excluded.
+    // Fix: scope the extraction to the DOM subtree that appears after the
+    // "Suchergebnisse" heading, then post-filter obvious nav noise.
     console.log("[lookup] extracting results...");
     const results = await page.evaluate(() => {
+      // Keywords that identify navigation / marketing text — not real results
+      const NAV_NOISE =
+        /UPIK|Plattform|D&B|Was ist|Suche\s*(l.schen|hier)|Datenschutz|Impressum|Cookie|Hinweis|Suchergebnis/i;
+
+      // ── Find the "Suchergebnisse" results container ───────────────────────
+      // Walk text nodes to find the heading, then use its ancestor as root
+      // so the main extraction never touches nav / marketing sections.
+      let searchRoot = document.body;
+      {
+        const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        let n;
+        while ((n = w.nextNode())) {
+          if (/^Suchergebnisse/i.test(n.textContent.trim())) {
+            // Walk up a few levels to get a meaningful container
+            let el = n.parentElement;
+            for (let i = 0; i < 4 && el && el.parentElement; i++) el = el.parentElement;
+            searchRoot = el || document.body;
+            break;
+          }
+        }
+      }
+
       const extracted = [];
 
-      // ── Strategy 1: DOM traversal based on UPIK card structure ───────────
-      // Walk all text nodes; when we find "D-U-N-S® Nummer", climb to a
-      // container that also holds the name link and address.
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      // ── Strategy 1: DOM traversal scoped to results section ──────────────
+      const walker = document.createTreeWalker(searchRoot, NodeFilter.SHOW_TEXT);
       const visited = new Set();
       let node;
 
       while ((node = walker.nextNode())) {
-        if (!/D-U-N-S/i.test(node.textContent)) continue;
+        // Only care about "D-U-N-S® Nummer:" lines (has the colon + digits)
+        if (!/D-U-N-S[^:]*:\s*[\d]/i.test(node.textContent)) continue;
 
-        // Climb up until we find a container with at least name + DUNS + address
+        // Climb to a tight container that holds the full result card
         let container = node.parentElement;
         for (let i = 0; i < 8; i++) {
           if (!container) break;
           const t = container.innerText || "";
-          if (/D-U-N-S/i.test(t) && (container.querySelector("a") || /Unternehmensadresse/i.test(t))) {
+          if (/D-U-N-S[^:]*:\s*[\d]/i.test(t) &&
+              (container.querySelector("a") || /Unternehmensadresse/i.test(t))) {
             break;
           }
           container = container.parentElement;
@@ -238,66 +265,65 @@ app.post("/api/lookup-duns", async (req, res) => {
 
         const text = container.innerText || "";
 
-        // Extract DUNS number (9 digits, possibly with spaces/dashes)
+        // Extract DUNS number
         const dunsMatch = text.match(/D-U-N-S[^:]*:\s*([\d][\d\s\-]{6,10}[\d])/i);
         if (!dunsMatch) continue;
         const duns = dunsMatch[1].replace(/[\s\-]/g, "");
         if (duns.length !== 9) continue;
 
-        // Extract name: prefer the text of the first <a> link in the container
+        // Extract name: first <a> link, or line before the DUNS line
         const link = container.querySelector("a");
         let name = link ? link.innerText.trim() : "";
         if (!name) {
-          // Fallback: first non-empty line before the DUNS line
           const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-          const dunsLineIdx = lines.findIndex((l) => /D-U-N-S/i.test(l));
-          name = dunsLineIdx > 0 ? lines[dunsLineIdx - 1] : lines[0] || "";
+          const idx = lines.findIndex((l) => /D-U-N-S[^:]*:\s*[\d]/i.test(l));
+          name = idx > 0 ? lines[idx - 1] : lines[0] || "";
         }
 
         // Extract address: text after "Unternehmensadresse:"
         const addrMatch = text.match(/Unternehmensadresse[:\s]+([^\n]+)/i);
         let address = addrMatch ? addrMatch[1].trim() : "";
         if (!address) {
-          // Fallback: line immediately after the DUNS line
           const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-          const dunsLineIdx = lines.findIndex((l) => /D-U-N-S/i.test(l));
-          if (dunsLineIdx >= 0 && dunsLineIdx + 1 < lines.length) {
-            const candidate = lines[dunsLineIdx + 1];
-            if (!/Unternehmensadresse/i.test(candidate)) address = candidate;
-            else if (dunsLineIdx + 2 < lines.length) address = lines[dunsLineIdx + 2];
+          const idx = lines.findIndex((l) => /D-U-N-S[^:]*:\s*[\d]/i.test(l));
+          if (idx >= 0 && idx + 1 < lines.length) {
+            const candidate = lines[idx + 1];
+            address = /Unternehmensadresse/i.test(candidate)
+              ? (lines[idx + 2] || "")
+              : candidate;
           }
         }
 
         extracted.push({ name, duns, address });
       }
 
-      if (extracted.length > 0) return extracted;
+      // ── Strategy 2: line-by-line fallback scoped to after "Suchergebnisse"
+      if (extracted.length === 0) {
+        const allLines = (document.body.innerText || "").split("\n").map((l) => l.trim()).filter(Boolean);
+        const startIdx = allLines.findIndex((l) => /^Suchergebnisse/i.test(l));
+        const lines = startIdx >= 0 ? allLines.slice(startIdx) : allLines;
 
-      // ── Strategy 2: parse full page text line by line ────────────────────
-      const lines = (document.body.innerText || "")
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean);
+        for (let i = 0; i < lines.length; i++) {
+          const dunsMatch = lines[i].match(/D-U-N-S[^:]*:\s*([\d][\d\s\-]{6,10}[\d])/i);
+          if (!dunsMatch) continue;
+          const duns = dunsMatch[1].replace(/[\s\-]/g, "");
+          if (duns.length !== 9) continue;
 
-      for (let i = 0; i < lines.length; i++) {
-        const dunsMatch = lines[i].match(/D-U-N-S[^:]*:\s*([\d][\d\s\-]{6,10}[\d])/i);
-        if (!dunsMatch) continue;
-        const duns = dunsMatch[1].replace(/[\s\-]/g, "");
-        if (duns.length !== 9) continue;
-
-        const name = i > 0 ? lines[i - 1] : "";
-        let address = "";
-        for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
-          if (/Unternehmensadresse/i.test(lines[j])) {
-            const inline = lines[j].replace(/Unternehmensadresse[:\s]*/i, "").trim();
-            address = inline || (lines[j + 1] || "");
-            break;
+          const name = i > 0 ? lines[i - 1] : "";
+          let address = "";
+          for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+            if (/Unternehmensadresse/i.test(lines[j])) {
+              const inline = lines[j].replace(/Unternehmensadresse[:\s]*/i, "").trim();
+              address = inline || (lines[j + 1] || "");
+              break;
+            }
           }
+          extracted.push({ name, duns, address });
         }
-        extracted.push({ name, duns, address });
       }
 
-      return extracted;
+      // ── Post-filter: discard nav/marketing noise ──────────────────────────
+      return extracted.filter((r) => !NAV_NOISE.test(r.name) && r.name.length < 100);
     });
 
     console.log(`[lookup] found ${results.length} result(s):`, JSON.stringify(results));
