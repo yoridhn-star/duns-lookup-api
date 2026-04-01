@@ -80,6 +80,16 @@ app.post("/api/lookup-duns", async (req, res) => {
 
     const page = await context.newPage();
 
+    // ── Block unnecessary resources to speed up page load ─────────────────
+    await page.route(
+      /\.(png|jpg|jpeg|gif|svg|webp|ico|css|woff|woff2|ttf|eot|otf|mp4|mp3|pdf)(\?.*)?$/i,
+      (route) => route.abort()
+    );
+    // Also block analytics / tracking / ads that slow down the page
+    await page.route(/google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar/i, (route) =>
+      route.abort()
+    );
+
     // ── Navigate ───────────────────────────────────────────────────────────
     console.log("[lookup] navigating to UPIK...");
     await page.goto("https://www.dnb.com/de-de/upik.html", {
@@ -98,7 +108,7 @@ app.post("/api/lookup-duns", async (req, res) => {
           !!document.querySelector("#country");
         return title.includes("UPIK") || hasForm;
       },
-      { timeout: 30_000 }
+      { timeout: 20_000 }
     );
     console.log(`[lookup] page ready — title: "${await page.title()}"`);
 
@@ -122,7 +132,7 @@ app.post("/api/lookup-duns", async (req, res) => {
         if (await btn.isVisible({ timeout: 3_000 }).catch(() => false)) {
           await btn.click({ timeout: 3_000 });
           console.log(`[lookup] dismissed cookies (click) with: ${sel}`);
-          await page.waitForTimeout(600);
+          await page.waitForTimeout(300);
           cookieDismissed = true;
           break;
         }
@@ -164,7 +174,7 @@ app.post("/api/lookup-duns", async (req, res) => {
         document.body.style.overflow = "auto";
         document.documentElement.style.overflow = "auto";
       });
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(200);
     }
 
     // ── Select country ─────────────────────────────────────────────────────
@@ -172,14 +182,12 @@ app.post("/api/lookup-duns", async (req, res) => {
     const countrySelect = page.locator("#country");
     await countrySelect.waitFor({ state: "visible", timeout: 15_000 });
     await countrySelect.selectOption({ label: country });
-    await page.waitForTimeout(300);
 
     // ── Type company name ──────────────────────────────────────────────────
     console.log(`[lookup] typing company name...`);
     const searchInput = page.locator('input[placeholder="Suche hier..."]');
     await searchInput.waitFor({ state: "visible", timeout: 10_000 });
     await searchInput.fill(companyName.trim());
-    await page.waitForTimeout(400);
 
     // ── Click submit (NOT "Suche löschen") ────────────────────────────────
     // The submit button is button[type="submit"] inside the form.
@@ -210,7 +218,7 @@ app.post("/api/lookup-duns", async (req, res) => {
     });
 
     // Extra buffer so JS can finish rendering
-    await page.waitForTimeout(2_000);
+    await page.waitForTimeout(1_000);
 
     // ── Extract results ────────────────────────────────────────────────────
     console.log("[lookup] extracting results...");
