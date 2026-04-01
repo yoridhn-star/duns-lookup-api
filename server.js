@@ -65,13 +65,13 @@ app.get("/health", (_req, res) => {
 // ── DUNS Lookup ───────────────────────────────────────────────────────────────
 
 app.post("/api/lookup-duns", async (req, res) => {
-  const { companyName, country = "Frankreich", email } = req.body;
+  const { companyName, city = "", country = "Frankreich", email } = req.body;
 
   if (!companyName || !companyName.trim()) {
     return res.status(400).json({ error: "companyName is required" });
   }
 
-  console.log(`[lookup] company="${companyName}" country="${country}" email="${email || "(none)"}"`);
+  console.log(`[lookup] company="${companyName}" city="${city}" country="${country}" email="${email || "(none)"}"`);
 
   let context = null;
 
@@ -79,7 +79,7 @@ app.post("/api/lookup-duns", async (req, res) => {
     const browser = await getBrowser();
 
     context = await browser.newContext({
-      viewport: { width: 1280, height: 720 },
+      viewport: { width: 800, height: 600 },
       userAgent:
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
       locale: "de-DE",
@@ -101,6 +101,11 @@ app.post("/api/lookup-duns", async (req, res) => {
       /\.(png|jpg|jpeg|gif|svg|webp|ico|css|woff|woff2|ttf|eot|otf|mp4|mp3|pdf)(\?.*)?$/i,
       (route) => route.abort()
     );
+    // Block third-party JS (analytics, ads, tracking) — keep only dnb.com scripts
+    await page.route(/\.js(\?.*)?$/i, (route) => {
+      const url = route.request().url();
+      return url.includes("dnb.com") ? route.continue() : route.abort();
+    });
     await page.route(/google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar/i,
       (route) => route.abort()
     );
@@ -182,6 +187,20 @@ app.post("/api/lookup-duns", async (req, res) => {
     const searchInput = page.locator('input[placeholder="Suche hier..."]');
     await searchInput.waitFor({ state: "visible", timeout: 10_000 });
     await searchInput.fill(companyName.trim());
+
+    // ── Type city (Stadt) if provided ─────────────────────────────────────
+    if (city && city.trim()) {
+      console.log(`[lookup] typing city "${city}"...`);
+      const cityInput = page.locator(
+        'input[placeholder="Stadt"], input[name*="tadt"], input[name*="city"], input[id*="tadt"], input[id*="city"]'
+      ).first();
+      const cityVisible = await cityInput.isVisible({ timeout: 3_000 }).catch(() => false);
+      if (cityVisible) {
+        await cityInput.fill(city.trim());
+      } else {
+        console.log("[lookup] city field not found — skipping");
+      }
+    }
 
     // ── Click submit ──────────────────────────────────────────────────────
     console.log("[lookup] clicking submit...");
@@ -327,6 +346,9 @@ app.post("/api/lookup-duns", async (req, res) => {
     });
 
     console.log(`[lookup] found ${results.length} result(s):`, JSON.stringify(results));
+
+    // ── Close page immediately after extraction ────────────────────────────
+    await page.close().catch(() => {});
 
     // ── Send email via Resend (optional) ──────────────────────────────────
     if (results.length > 0 && email && email.trim() && RESEND_API_KEY) {
