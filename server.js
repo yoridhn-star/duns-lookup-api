@@ -375,19 +375,18 @@ app.post("/api/lookup-duns", async (req, res) => {
       console.warn("[lookup] RESEND_API_KEY not set — skipping email");
     }
 
-    const first = results[0] || null;
-    const data = first
-      ? { companyName: first.name || companyName, dunsNumber: first.duns, address: first.address }
+    // Keep only the best result: first entry that has name + duns + address.
+    // Fall back to first entry with just a duns if nothing complete is found.
+    const best =
+      results.find((r) => r.name && r.duns && r.address) ||
+      results.find((r) => r.duns) ||
+      null;
+
+    const data = best
+      ? { companyName: best.name || companyName, dunsNumber: best.duns, address: best.address || "" }
       : null;
 
-    return res.json({
-      success: true,
-      companyName,
-      country,
-      resultsCount: results.length,
-      results,
-      data,
-    });
+    return res.json({ success: true, data });
   } catch (err) {
     console.error("[lookup] error:", err.message);
     return res.status(500).json({ error: "Lookup failed", details: err.message });
