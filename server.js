@@ -20,10 +20,46 @@ app.use(
   })
 );
 
+// ── Browser singleton ─────────────────────────────────────────────────────────
+// Launch once at startup and reuse across requests.
+// Each request gets its own context + page (isolated), only the binary process
+// is shared — this removes ~20-40s of Chromium startup per request.
+
+let _browser = null;
+
+function getBrowserArgs() {
+  const display = process.env.DISPLAY || ":99";
+  return {
+    headless: false, // headed required — Cloudflare blocks headless
+    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
+    args: [
+      `--display=${display}`,
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--window-size=1280,720",
+    ],
+    env: { ...process.env, DISPLAY: display },
+  };
+}
+
+async function getBrowser() {
+  if (_browser && _browser.isConnected()) return _browser;
+  console.log("[browser] launching Chromium...");
+  _browser = await chromium.launch(getBrowserArgs());
+  _browser.on("disconnected", () => {
+    console.warn("[browser] disconnected — will relaunch on next request");
+    _browser = null;
+  });
+  console.log("[browser] Chromium ready");
+  return _browser;
+}
+
 // ── Health check ──────────────────────────────────────────────────────────────
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", ts: new Date().toISOString() });
+  res.json({ status: "ok", browserReady: !!(_browser && _browser.isConnected()), ts: new Date().toISOString() });
 });
 
 // ── DUNS Lookup ───────────────────────────────────────────────────────────────
@@ -37,31 +73,12 @@ app.post("/api/lookup-duns", async (req, res) => {
 
   console.log(`[lookup] company="${companyName}" country="${country}" email="${email || "(none)"}"`);
 
-  let browser = null;
+  let context = null;
 
   try {
-    // ── Launch Chromium with Xvfb display ──────────────────────────────────
-    // DISPLAY=:99 must be set in the environment (Dockerfile starts Xvfb :99)
-    const display = process.env.DISPLAY || ":99";
+    const browser = await getBrowser();
 
-    browser = await chromium.launch({
-      headless: false, // headed required — Cloudflare blocks headless
-      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || undefined,
-      args: [
-        `--display=${display}`,
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--window-size=1280,720",
-      ],
-      env: {
-        ...process.env,
-        DISPLAY: display,
-      },
-    });
-
-    const context = await browser.newContext({
+    context = await browser.newContext({
       viewport: { width: 1280, height: 720 },
       userAgent:
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -70,24 +87,22 @@ app.post("/api/lookup-duns", async (req, res) => {
     });
 
     // ── Pre-set TrustArc / GDPR consent cookies ───────────────────────────
-    // Setting these before navigation prevents the cookie banner from showing
     await context.addCookies([
-      { name: "notice_behavior",            value: "expressed,eu", domain: ".dnb.com", path: "/" },
-      { name: "notice_gdpr_prefs",          value: "0:1:2",        domain: ".dnb.com", path: "/" },
-      { name: "cmapi_cookie_privacy",       value: "permit 1,2,3", domain: ".dnb.com", path: "/" },
-      { name: "truste.eu.cookie.notice_gdpr_pr498", value: "1",   domain: ".dnb.com", path: "/" },
+      { name: "notice_behavior",                    value: "expressed,eu", domain: ".dnb.com", path: "/" },
+      { name: "notice_gdpr_prefs",                  value: "0:1:2",        domain: ".dnb.com", path: "/" },
+      { name: "cmapi_cookie_privacy",               value: "permit 1,2,3", domain: ".dnb.com", path: "/" },
+      { name: "truste.eu.cookie.notice_gdpr_pr498", value: "1",            domain: ".dnb.com", path: "/" },
     ]);
 
     const page = await context.newPage();
 
-    // ── Block unnecessary resources to speed up page load ─────────────────
+    // ── Block unnecessary resources ───────────────────────────────────────
     await page.route(
       /\.(png|jpg|jpeg|gif|svg|webp|ico|css|woff|woff2|ttf|eot|otf|mp4|mp3|pdf)(\?.*)?$/i,
       (route) => route.abort()
     );
-    // Also block analytics / tracking / ads that slow down the page
-    await page.route(/google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar/i, (route) =>
-      route.abort()
+    await page.route(/google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar/i,
+      (route) => route.abort()
     );
 
     // ── Navigate ───────────────────────────────────────────────────────────
@@ -97,9 +112,8 @@ app.post("/api/lookup-duns", async (req, res) => {
       timeout: 90_000,
     });
 
-    // ── Wait for Cloudflare to clear ───────────────────────────────────────
-    // Either the page title contains "UPIK" or the search form appears
-    console.log("[lookup] waiting for Cloudflare / page to load...");
+    // ── Wait for Cloudflare / page to settle ──────────────────────────────
+    console.log("[lookup] waiting for page to load...");
     await page.waitForFunction(
       () => {
         const title = document.title || "";
@@ -113,9 +127,9 @@ app.post("/api/lookup-duns", async (req, res) => {
     console.log(`[lookup] page ready — title: "${await page.title()}"`);
 
     // ── Dismiss cookie banner ─────────────────────────────────────────────
-    // Strategy 1: try to click "Obligatoire uniquement" / "Nur erforderliche"
+    // Strategy 1: click the "required only" button
     let cookieDismissed = false;
-    const cookieSelectors = [
+    for (const sel of [
       'button:has-text("Obligatoire uniquement")',
       'button:has-text("Nur erforderliche")',
       'button:has-text("Nur notwendige")',
@@ -124,53 +138,33 @@ app.post("/api/lookup-duns", async (req, res) => {
       "#onetrust-reject-all-handler",
       'a:has-text("Obligatoire uniquement")',
       'a:has-text("Nur erforderliche")',
-    ];
-
-    for (const sel of cookieSelectors) {
+    ]) {
       try {
         const btn = page.locator(sel).first();
         if (await btn.isVisible({ timeout: 3_000 }).catch(() => false)) {
           await btn.click({ timeout: 3_000 });
-          console.log(`[lookup] dismissed cookies (click) with: ${sel}`);
+          console.log(`[lookup] dismissed cookies (click): ${sel}`);
           await page.waitForTimeout(300);
           cookieDismissed = true;
           break;
         }
-      } catch {
-        // selector not found or click failed — try next
-      }
+      } catch { /* try next */ }
     }
 
-    // Strategy 2 (fallback): remove TrustArc banner nodes directly from the DOM
+    // Strategy 2: remove banner nodes + restore overflow
     if (!cookieDismissed) {
-      console.log("[lookup] cookie click failed — removing banner via DOM");
+      console.log("[lookup] removing cookie banner via DOM");
       await page.evaluate(() => {
-        const selectors = [
-          "#truste-consent-track",
-          "#truste-consent-content",
-          ".truste-banner-overlay",
-          "#trustarc-banner-overlay",
-          "#consent_blackbar",
-          "#truste-show-consent",
-          ".truste_popframe",
-          "iframe[id*='trustarc']",
-          "iframe[src*='consent.trustarc']",
+        [
+          "#truste-consent-track", "#truste-consent-content", ".truste-banner-overlay",
+          "#trustarc-banner-overlay", "#consent_blackbar", "#truste-show-consent",
+          ".truste_popframe", "iframe[id*='trustarc']", "iframe[src*='consent.trustarc']",
           "iframe[src*='truste']",
-        ];
-        selectors.forEach((sel) => {
-          document.querySelectorAll(sel).forEach((el) => el.remove());
-        });
-        // Set consent cookies via JS so they persist across navigation
-        const cookiesToSet = [
-          "notice_behavior=expressed,eu",
-          "notice_gdpr_prefs=0:1:2",
-          "cmapi_cookie_privacy=permit 1,2,3",
-          "truste.eu.cookie.notice_gdpr_pr498=1",
-        ];
-        cookiesToSet.forEach((c) => {
-          document.cookie = `${c};path=/;domain=.dnb.com`;
-        });
-        // Restore pointer-events in case the overlay was blocking clicks
+        ].forEach((s) => document.querySelectorAll(s).forEach((el) => el.remove()));
+        [
+          "notice_behavior=expressed,eu", "notice_gdpr_prefs=0:1:2",
+          "cmapi_cookie_privacy=permit 1,2,3", "truste.eu.cookie.notice_gdpr_pr498=1",
+        ].forEach((c) => { document.cookie = `${c};path=/;domain=.dnb.com`; });
         document.body.style.overflow = "auto";
         document.documentElement.style.overflow = "auto";
       });
@@ -184,15 +178,13 @@ app.post("/api/lookup-duns", async (req, res) => {
     await countrySelect.selectOption({ label: country });
 
     // ── Type company name ──────────────────────────────────────────────────
-    console.log(`[lookup] typing company name...`);
+    console.log("[lookup] typing company name...");
     const searchInput = page.locator('input[placeholder="Suche hier..."]');
     await searchInput.waitFor({ state: "visible", timeout: 10_000 });
     await searchInput.fill(companyName.trim());
 
-    // ── Click submit (NOT "Suche löschen") ────────────────────────────────
-    // The submit button is button[type="submit"] inside the form.
-    // "Suche löschen" is a different element (link/button with that text).
-    console.log("[lookup] clicking submit button...");
+    // ── Click submit ──────────────────────────────────────────────────────
+    console.log("[lookup] clicking submit...");
     const submitBtn = page.locator('button[type="submit"]').filter({
       hasNot: page.locator(':text("Suche löschen")'),
     });
@@ -200,73 +192,115 @@ app.post("/api/lookup-duns", async (req, res) => {
 
     // ── Wait for results ───────────────────────────────────────────────────
     console.log("[lookup] waiting for results...");
-    // Results appear after 4-6s — wait for result rows or a "no results" message
     await page.waitForFunction(
-      () => {
-        // Typical result containers on the UPIK page
-        const rows = document.querySelectorAll(
-          ".result-row, .upik-result, table tbody tr, [class*='result'] tr, [class*='Result'] tr"
-        );
-        const noResult = document.querySelector(
-          "[class*='no-result'], [class*='noResult'], [class*='empty']"
-        );
-        return rows.length > 0 || noResult !== null;
-      },
+      () => /D-U-N-S/i.test(document.body.innerText),
       { timeout: 15_000 }
-    ).catch(() => {
-      console.log("[lookup] waitForFunction timed out — will try to extract anyway");
-    });
+    ).catch(() => console.log("[lookup] result wait timed out — extracting anyway"));
 
-    // Extra buffer so JS can finish rendering
     await page.waitForTimeout(1_000);
 
+    // ── Diagnostic: log the results area text ─────────────────────────────
+    const pageText = await page.evaluate(() => document.body.innerText);
+    console.log("[lookup] page text (first 2000 chars):\n" + pageText.slice(0, 2000));
+
     // ── Extract results ────────────────────────────────────────────────────
+    // UPIK result structure (observed):
+    //   <a>COMPANY NAME</a>          ← name as link
+    //   D-U-N-S® Nummer: 776849358  ← DUNS line
+    //   Unternehmensadresse:         ← address label
+    //   38 RUE D'ITALIE, 62570 ...  ← address value
     console.log("[lookup] extracting results...");
     const results = await page.evaluate(() => {
       const extracted = [];
 
-      // Strategy 1 — structured result rows with labelled cells
-      const rows = document.querySelectorAll(
-        ".result-row, .upik-result, table tbody tr, [class*='result'] tr, [class*='Result'] tr"
-      );
+      // ── Strategy 1: DOM traversal based on UPIK card structure ───────────
+      // Walk all text nodes; when we find "D-U-N-S® Nummer", climb to a
+      // container that also holds the name link and address.
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      const visited = new Set();
+      let node;
 
-      rows.forEach((row) => {
-        const cells = Array.from(row.querySelectorAll("td, [class*='cell'], [class*='Cell']"));
-        if (cells.length === 0) return;
+      while ((node = walker.nextNode())) {
+        if (!/D-U-N-S/i.test(node.textContent)) continue;
 
-        const texts = cells.map((c) => c.innerText.trim()).filter(Boolean);
-        if (texts.length === 0) return;
+        // Climb up until we find a container with at least name + DUNS + address
+        let container = node.parentElement;
+        for (let i = 0; i < 8; i++) {
+          if (!container) break;
+          const t = container.innerText || "";
+          if (/D-U-N-S/i.test(t) && (container.querySelector("a") || /Unternehmensadresse/i.test(t))) {
+            break;
+          }
+          container = container.parentElement;
+        }
+        if (!container || visited.has(container)) continue;
+        visited.add(container);
 
-        // Look for a DUNS-like number (9 digits) in any cell
-        const dunsCell = texts.find((t) => /^\d{9}$/.test(t.replace(/[\s\-]/g, "")));
-        if (!dunsCell) return;
+        const text = container.innerText || "";
 
-        extracted.push({
-          name: texts[0] || "",
-          duns: dunsCell.replace(/[\s\-]/g, ""),
-          address: texts.filter((t) => t !== texts[0] && t !== dunsCell).join(", "),
-        });
-      });
+        // Extract DUNS number (9 digits, possibly with spaces/dashes)
+        const dunsMatch = text.match(/D-U-N-S[^:]*:\s*([\d][\d\s\-]{6,10}[\d])/i);
+        if (!dunsMatch) continue;
+        const duns = dunsMatch[1].replace(/[\s\-]/g, "");
+        if (duns.length !== 9) continue;
+
+        // Extract name: prefer the text of the first <a> link in the container
+        const link = container.querySelector("a");
+        let name = link ? link.innerText.trim() : "";
+        if (!name) {
+          // Fallback: first non-empty line before the DUNS line
+          const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+          const dunsLineIdx = lines.findIndex((l) => /D-U-N-S/i.test(l));
+          name = dunsLineIdx > 0 ? lines[dunsLineIdx - 1] : lines[0] || "";
+        }
+
+        // Extract address: text after "Unternehmensadresse:"
+        const addrMatch = text.match(/Unternehmensadresse[:\s]+([^\n]+)/i);
+        let address = addrMatch ? addrMatch[1].trim() : "";
+        if (!address) {
+          // Fallback: line immediately after the DUNS line
+          const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+          const dunsLineIdx = lines.findIndex((l) => /D-U-N-S/i.test(l));
+          if (dunsLineIdx >= 0 && dunsLineIdx + 1 < lines.length) {
+            const candidate = lines[dunsLineIdx + 1];
+            if (!/Unternehmensadresse/i.test(candidate)) address = candidate;
+            else if (dunsLineIdx + 2 < lines.length) address = lines[dunsLineIdx + 2];
+          }
+        }
+
+        extracted.push({ name, duns, address });
+      }
 
       if (extracted.length > 0) return extracted;
 
-      // Strategy 2 — scan entire page text for DUNS patterns
-      const bodyText = document.body.innerText;
-      const dunsPattern = /D-U-N-S[^\d]*(\d[\d\s\-]{7,10}\d)/gi;
-      let match;
-      while ((match = dunsPattern.exec(bodyText)) !== null) {
-        extracted.push({
-          name: "",
-          duns: match[1].replace(/[\s\-]/g, ""),
-          address: "",
-          raw: true,
-        });
+      // ── Strategy 2: parse full page text line by line ────────────────────
+      const lines = (document.body.innerText || "")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      for (let i = 0; i < lines.length; i++) {
+        const dunsMatch = lines[i].match(/D-U-N-S[^:]*:\s*([\d][\d\s\-]{6,10}[\d])/i);
+        if (!dunsMatch) continue;
+        const duns = dunsMatch[1].replace(/[\s\-]/g, "");
+        if (duns.length !== 9) continue;
+
+        const name = i > 0 ? lines[i - 1] : "";
+        let address = "";
+        for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+          if (/Unternehmensadresse/i.test(lines[j])) {
+            const inline = lines[j].replace(/Unternehmensadresse[:\s]*/i, "").trim();
+            address = inline || (lines[j + 1] || "");
+            break;
+          }
+        }
+        extracted.push({ name, duns, address });
       }
 
       return extracted;
     });
 
-    console.log(`[lookup] found ${results.length} result(s)`);
+    console.log(`[lookup] found ${results.length} result(s):`, JSON.stringify(results));
 
     // ── Send email via Resend (optional) ──────────────────────────────────
     if (results.length > 0 && email && email.trim() && RESEND_API_KEY) {
@@ -310,13 +344,11 @@ app.post("/api/lookup-duns", async (req, res) => {
         console.log(`[lookup] email sent to ${email}`);
       } catch (mailErr) {
         console.error("[lookup] email send failed:", mailErr.message);
-        // Non-fatal — still return results to the caller
       }
     } else if (email && email.trim() && !RESEND_API_KEY) {
       console.warn("[lookup] RESEND_API_KEY not set — skipping email");
     }
 
-    // Build top-level data shortcut (first result) for convenience
     const first = results[0] || null;
     const data = first
       ? { companyName: first.name || companyName, dunsNumber: first.duns, address: first.address }
@@ -332,14 +364,10 @@ app.post("/api/lookup-duns", async (req, res) => {
     });
   } catch (err) {
     console.error("[lookup] error:", err.message);
-    return res.status(500).json({
-      error: "Lookup failed",
-      details: err.message,
-    });
+    return res.status(500).json({ error: "Lookup failed", details: err.message });
   } finally {
-    if (browser) {
-      await browser.close().catch(() => {});
-    }
+    // Close context (isolated session) but keep the browser process alive
+    if (context) await context.close().catch(() => {});
   }
 });
 
@@ -356,9 +384,11 @@ function escapeHtml(str) {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[server] DUNS API listening on port ${PORT}`);
   console.log(`[server] DISPLAY=${process.env.DISPLAY || "(not set)"}`);
   console.log(`[server] RESEND=${RESEND_API_KEY ? "configured" : "NOT SET"}`);
   console.log(`[server] CORS origin=${FRONTEND_URL}`);
+  // Warm up the browser immediately so the first request doesn't pay launch cost
+  getBrowser().catch((err) => console.error("[server] browser warm-up failed:", err.message));
 });
