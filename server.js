@@ -131,50 +131,23 @@ app.post("/api/lookup-duns", async (req, res) => {
     );
     console.log(`[lookup] page ready — title: "${await page.title()}"`);
 
-    // ── Dismiss cookie banner ─────────────────────────────────────────────
-    // Strategy 1: click the "required only" button
-    let cookieDismissed = false;
-    for (const sel of [
-      'button:has-text("Obligatoire uniquement")',
-      'button:has-text("Nur erforderliche")',
-      'button:has-text("Nur notwendige")',
-      'button:has-text("Accept required")',
-      '[data-testid="accept-required"]',
-      "#onetrust-reject-all-handler",
-      'a:has-text("Obligatoire uniquement")',
-      'a:has-text("Nur erforderliche")',
-    ]) {
-      try {
-        const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 3_000 }).catch(() => false)) {
-          await btn.click({ timeout: 3_000 });
-          console.log(`[lookup] dismissed cookies (click): ${sel}`);
-          await page.waitForTimeout(300);
-          cookieDismissed = true;
-          break;
-        }
-      } catch { /* try next */ }
-    }
-
-    // Strategy 2: remove banner nodes + restore overflow
-    if (!cookieDismissed) {
-      console.log("[lookup] removing cookie banner via DOM");
-      await page.evaluate(() => {
-        [
-          "#truste-consent-track", "#truste-consent-content", ".truste-banner-overlay",
-          "#trustarc-banner-overlay", "#consent_blackbar", "#truste-show-consent",
-          ".truste_popframe", "iframe[id*='trustarc']", "iframe[src*='consent.trustarc']",
-          "iframe[src*='truste']",
-        ].forEach((s) => document.querySelectorAll(s).forEach((el) => el.remove()));
-        [
-          "notice_behavior=expressed,eu", "notice_gdpr_prefs=0:1:2",
-          "cmapi_cookie_privacy=permit 1,2,3", "truste.eu.cookie.notice_gdpr_pr498=1",
-        ].forEach((c) => { document.cookie = `${c};path=/;domain=.dnb.com`; });
-        document.body.style.overflow = "auto";
-        document.documentElement.style.overflow = "auto";
-      });
-      await page.waitForTimeout(200);
-    }
+    // ── Dismiss cookie banner via DOM removal (faster than click retries) ────
+    console.log("[lookup] removing cookie banner via DOM");
+    await page.evaluate(() => {
+      [
+        "#truste-consent-track", "#truste-consent-content", ".truste-banner-overlay",
+        "#trustarc-banner-overlay", "#consent_blackbar", "#truste-show-consent",
+        ".truste_popframe", "iframe[id*='trustarc']", "iframe[src*='consent.trustarc']",
+        "iframe[src*='truste']",
+      ].forEach((s) => document.querySelectorAll(s).forEach((el) => el.remove()));
+      [
+        "notice_behavior=expressed,eu", "notice_gdpr_prefs=0:1:2",
+        "cmapi_cookie_privacy=permit 1,2,3", "truste.eu.cookie.notice_gdpr_pr498=1",
+      ].forEach((c) => { document.cookie = `${c};path=/;domain=.dnb.com`; });
+      document.body.style.overflow = "auto";
+      document.documentElement.style.overflow = "auto";
+    });
+    await page.waitForTimeout(100);
 
     // ── Select country ─────────────────────────────────────────────────────
     console.log(`[lookup] selecting country "${country}"...`);
@@ -212,11 +185,12 @@ app.post("/api/lookup-duns", async (req, res) => {
     // ── Wait for results ───────────────────────────────────────────────────
     console.log("[lookup] waiting for results...");
     await page.waitForFunction(
-      () => /D-U-N-S/i.test(document.body.innerText),
-      { timeout: 15_000 }
+      () => {
+        const text = document.body.innerText;
+        return text.includes("Suchergebnisse") || text.includes("Keine Ergebnisse") || /D-U-N-S[^:]*:\s*\d/i.test(text);
+      },
+      { timeout: 30_000 }
     ).catch(() => console.log("[lookup] result wait timed out — extracting anyway"));
-
-    await page.waitForTimeout(1_000);
 
     // ── Diagnostic: log the results area text ─────────────────────────────
     const pageText = await page.evaluate(() => document.body.innerText);
@@ -436,6 +410,18 @@ app.listen(PORT, async () => {
   console.log(`[server] DISPLAY=${process.env.DISPLAY || "(not set)"}`);
   console.log(`[server] RESEND=${RESEND_API_KEY ? "configured" : "NOT SET"}`);
   console.log(`[server] CORS origin=${FRONTEND_URL}`);
-  // Warm up the browser immediately so the first request doesn't pay launch cost
-  getBrowser().catch((err) => console.error("[server] browser warm-up failed:", err.message));
+  // Warm up the browser and pre-cache the UPIK page
+  getBrowser().then(async (browser) => {
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 800, height: 600 } });
+      const pg = await ctx.newPage();
+      await pg.route(/\.(png|jpg|jpeg|gif|svg|webp|ico|css|woff|woff2|ttf|eot|otf|mp4|mp3|pdf)(\?.*)?$/i, (r) => r.abort());
+      await pg.goto("https://www.dnb.com/de-de/upik.html", { waitUntil: "domcontentloaded", timeout: 60_000 });
+      console.log("[server] UPIK page pre-warmed");
+      await pg.close().catch(() => {});
+      await ctx.close().catch(() => {});
+    } catch (err) {
+      console.error("[server] pre-warm failed:", err.message);
+    }
+  }).catch((err) => console.error("[server] browser warm-up failed:", err.message));
 });
