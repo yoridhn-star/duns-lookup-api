@@ -2,12 +2,24 @@ const express = require("express");
 const cors = require("cors");
 const { chromium } = require("playwright");
 const { Resend } = require("resend");
+const nodemailer = require("nodemailer");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const GMAIL_USER = process.env.GMAIL_USER || "dunslookupofficial@gmail.com";
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
 const EMAIL_FROM = process.env.EMAIL_FROM || "DUNS Lookup <noreply@yourdomain.com>";
 const FRONTEND_URL = process.env.FRONTEND_URL || "*";
+
+// ── Gmail SMTP transporter ────────────────────────────────────────────────────
+const gmailTransporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: GMAIL_USER,
+    pass: GMAIL_APP_PASSWORD,
+  },
+});
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
@@ -324,51 +336,37 @@ app.post("/api/lookup-duns", async (req, res) => {
     // ── Close page immediately after extraction ────────────────────────────
     await page.close().catch(() => {});
 
-    // ── Send email via Resend (optional) ──────────────────────────────────
-    if (results.length > 0 && email && email.trim() && RESEND_API_KEY) {
+    // ── Send email (Resend if key set, else Gmail SMTP) ───────────────────
+    if (results.length > 0 && email && email.trim()) {
       try {
-        const resend = new Resend(RESEND_API_KEY);
-        const resultRows = results
-          .map(
-            (r, i) =>
-              `<tr>
-                <td style="padding:8px;border:1px solid #ddd">${i + 1}</td>
-                <td style="padding:8px;border:1px solid #ddd">${escapeHtml(r.name)}</td>
-                <td style="padding:8px;border:1px solid #ddd"><b>${escapeHtml(r.duns)}</b></td>
-                <td style="padding:8px;border:1px solid #ddd">${escapeHtml(r.address)}</td>
-              </tr>`
-          )
-          .join("");
+        const best = results.find((r) => r.name && r.duns) || results[0];
+        const htmlEmail = buildEmailHtml(best, companyName, country);
 
-        await resend.emails.send({
-          from: EMAIL_FROM,
-          to: email.trim(),
-          subject: `DUNS Lookup : résultats pour "${companyName}"`,
-          html: `
-            <h2>Résultats DUNS pour : ${escapeHtml(companyName)}</h2>
-            <p>Pays : ${escapeHtml(country)}</p>
-            <table style="border-collapse:collapse;width:100%">
-              <thead>
-                <tr style="background:#f5f5f5">
-                  <th style="padding:8px;border:1px solid #ddd">#</th>
-                  <th style="padding:8px;border:1px solid #ddd">Entreprise</th>
-                  <th style="padding:8px;border:1px solid #ddd">D-U-N-S</th>
-                  <th style="padding:8px;border:1px solid #ddd">Adresse</th>
-                </tr>
-              </thead>
-              <tbody>${resultRows}</tbody>
-            </table>
-            <p style="color:#888;font-size:12px;margin-top:20px">
-              Envoyé par DUNS Lookup — ${new Date().toLocaleString("fr-FR")}
-            </p>
-          `,
-        });
-        console.log(`[lookup] email sent to ${email}`);
+        if (RESEND_API_KEY) {
+          // ── Resend (domain-based) ───────────────────────────────────────
+          const resend = new Resend(RESEND_API_KEY);
+          await resend.emails.send({
+            from: EMAIL_FROM,
+            to: email.trim(),
+            subject: `Votre numéro D-U-N-S — ${escapeHtml(best.name || companyName)}`,
+            html: htmlEmail,
+          });
+          console.log(`[email] sent to ${email.trim()} via Resend`);
+        } else if (GMAIL_APP_PASSWORD) {
+          // ── Gmail SMTP (fallback) ───────────────────────────────────────
+          await gmailTransporter.sendMail({
+            from: `"DUNS Lookup" <${GMAIL_USER}>`,
+            to: email.trim(),
+            subject: `Votre numéro D-U-N-S — ${escapeHtml(best.name || companyName)}`,
+            html: htmlEmail,
+          });
+          console.log(`[email] sent to ${email.trim()} via Gmail`);
+        } else {
+          console.warn("[email] no email provider configured (RESEND_API_KEY or GMAIL_APP_PASSWORD missing) — skipping");
+        }
       } catch (mailErr) {
-        console.error("[lookup] email send failed:", mailErr.message);
+        console.error("[email] send failed:", mailErr.message);
       }
-    } else if (email && email.trim() && !RESEND_API_KEY) {
-      console.warn("[lookup] RESEND_API_KEY not set — skipping email");
     }
 
     // Keep only the best result: first entry that has name + duns + address.
@@ -394,6 +392,77 @@ app.post("/api/lookup-duns", async (req, res) => {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+function buildEmailHtml(result, companyName, country) {
+  const name = escapeHtml(result.name || companyName);
+  const duns = escapeHtml(result.duns || "—");
+  const address = escapeHtml(result.address || "");
+  const date = new Date().toLocaleDateString("fr-FR", { year: "numeric", month: "long", day: "numeric" });
+
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Votre numéro D-U-N-S</title>
+</head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(99,102,241,0.10);">
+          <!-- Header -->
+          <tr>
+            <td style="background:linear-gradient(135deg,#4f46e5 0%,#6366f1 100%);padding:36px 40px;text-align:center;">
+              <div style="font-size:26px;font-weight:700;color:#ffffff;letter-spacing:-0.5px;">DUNS Lookup</div>
+              <div style="font-size:13px;color:#c7d2fe;margin-top:6px;">Résultat de votre recherche</div>
+            </td>
+          </tr>
+          <!-- Body -->
+          <tr>
+            <td style="padding:40px 40px 32px;">
+              <p style="margin:0 0 24px;font-size:15px;color:#374151;">Bonjour,</p>
+              <p style="margin:0 0 28px;font-size:15px;color:#374151;line-height:1.6;">
+                Votre recherche pour <strong>${name}</strong> a abouti. Voici votre numéro D-U-N-S&reg; :
+              </p>
+
+              <!-- Result card -->
+              <table width="100%" cellpadding="0" cellspacing="0" style="background:#f8f7ff;border:1px solid #e0e7ff;border-radius:10px;margin-bottom:28px;">
+                <tr>
+                  <td style="padding:28px 32px;">
+                    <div style="font-size:12px;font-weight:600;color:#6366f1;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">Entreprise</div>
+                    <div style="font-size:17px;font-weight:600;color:#111827;margin-bottom:20px;">${name}</div>
+
+                    <div style="font-size:12px;font-weight:600;color:#6366f1;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Numéro D-U-N-S&reg;</div>
+                    <div style="font-size:36px;font-weight:800;color:#4f46e5;letter-spacing:4px;margin-bottom:20px;">${duns}</div>
+
+                    ${address ? `<div style="font-size:12px;font-weight:600;color:#6366f1;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;">Adresse</div>
+                    <div style="font-size:14px;color:#374151;">${address}</div>` : ""}
+                  </td>
+                </tr>
+              </table>
+
+              <p style="margin:0;font-size:14px;color:#6b7280;line-height:1.6;">
+                Merci d'avoir utilisé DUNS Lookup. Ce résultat a été obtenu le ${date} via la base de données publique UPIK de Dun &amp; Bradstreet.
+              </p>
+            </td>
+          </tr>
+          <!-- Footer -->
+          <tr>
+            <td style="background:#f8f7ff;border-top:1px solid #e0e7ff;padding:20px 40px;text-align:center;">
+              <p style="margin:0;font-size:11px;color:#9ca3af;line-height:1.6;">
+                Service indépendant, non affilié à Dun &amp; Bradstreet&reg; · Les données proviennent de la base UPIK publique.<br>
+                © ${new Date().getFullYear()} DUNS Lookup — dunslookupofficial@gmail.com
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
 function escapeHtml(str) {
   if (!str) return "";
   return String(str)
@@ -409,6 +478,7 @@ app.listen(PORT, async () => {
   console.log(`[server] DUNS API listening on port ${PORT}`);
   console.log(`[server] DISPLAY=${process.env.DISPLAY || "(not set)"}`);
   console.log(`[server] RESEND=${RESEND_API_KEY ? "configured" : "NOT SET"}`);
+  console.log(`[server] GMAIL=${GMAIL_APP_PASSWORD ? "configured" : "NOT SET"} (user=${GMAIL_USER})`);
   console.log(`[server] CORS origin=${FRONTEND_URL}`);
   // Warm up the browser and pre-cache the UPIK page
   getBrowser().then(async (browser) => {
